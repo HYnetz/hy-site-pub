@@ -1,0 +1,7 @@
+Subject: Add a free official-path helper (we pay CPM, auto-pause if complaints)
+
+Hi {Name},
+we publish evidence-first guides for {topic}. I can place a small helper on your pages that walks users through the official path. We pay a small CPM from our revenue; you can remove it anytime. If complaints ever exceed 1.2/1k, it auto-pauses.
+
+Want the one-line snippet and the one-pager?
+– {You}

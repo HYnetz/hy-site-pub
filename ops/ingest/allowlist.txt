@@ -1,0 +1,14 @@
+wikipedia.org
+nasa.gov
+noaa.gov
+data.gov
+data.europa.eu
+ec.europa.eu
+esa.int
+eia.gov
+epa.gov
+usgs.gov
+fao.org
+worldbank.org
+un.org
+europa.eu

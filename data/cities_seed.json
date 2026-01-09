@@ -1,0 +1,7 @@
+{
+ "en": ["london","manchester","birmingham","leeds","bristol"],
+ "de": ["berlin","hamburg","muenchen","koeln","frankfurt"],
+ "fr": ["paris","lyon","marseille","toulouse","lille"],
+ "es": ["madrid","barcelona","valencia","sevilla","zaragoza"],
+ "it": ["roma","milano","napoli","torino","palermo"]
+}

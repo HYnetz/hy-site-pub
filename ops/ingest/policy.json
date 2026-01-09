@@ -1,0 +1,12 @@
+{
+  "concurrency": 24,
+  "per_host_delay_ms": 150,
+  "retries": 3,
+  "timeout_sec": 20,
+  "max_bytes": 5242880,
+  "sitemap_max_bytes": 67108864,
+  "sitemap_loc_target": 2000,
+  "user_agent": "HYBot/1.0",
+  "allow_unknown_robots": false,
+  "max_ratio": 50.0
+}

@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$HOME/hy"
+REL_DIR="$ROOT/releases"
+SRC="$ROOT/dist_ready"
+CUR="$ROOT/current"
+mkdir -p "$REL_DIR"
+ts="$(date +%F_%H%M%S)"
+dst="$REL_DIR/$ts"; mkdir -p "$dst"
+
+copy_tree() {
+  if command -v rsync >/dev/null 2>&1; then rsync -a "$1/." "$2/"; 
+  else ( shopt -s dotglob nullglob; cp -a "$1"/* "$2"/ 2>/dev/null || true ); fi
+}
+
+# 1) Copy new build (including /data) without deleting existing
+[[ -d "$SRC" ]] && find "$SRC" -type f 2>/dev/null | grep -q . && copy_tree "$SRC" "$dst" || true
+
+# 2) Carry-over protected top-level if missing
+for f in index.html robots.txt sitemap_index.xml sitemap.xsl imprint.html privacy.html; do
+  [[ -f "$CUR/$f" && ! -f "$dst/$f" ]] && cp -f "$CUR/$f" "$dst/$f"
+done
+
+# 3) Merge redirects (/t) from current
+if [[ -d "$CUR/t" ]]; then mkdir -p "$dst/t"; ( shopt -s dotglob nullglob; cp -an "$CUR/t"/* "$dst/t"/ 2>/dev/null || true ); fi
+
+# 4) Backfill legal + robots if still missing
+for f in imprint.html privacy.html; do [[ -f "$dst/$f" ]] || echo "<!doctype html><meta charset='utf-8'><h1>${f%.*}</h1>" > "$dst/$f"; done
+[[ -f "$dst/robots.txt" ]] || printf "User-agent: *\nDisallow: /\n" > "$dst/robots.txt"
+
+# 5) ALWAYS (re)build sitemap_index.xml from all sitemaps present
+maps=$(cd "$dst" && find . -type f -name 'sitemap*.xml' ! -name 'sitemap_index.xml' -printf '%P\n' | sort || true)
+{
+  printf '<?xml version="1.0" encoding="UTF-8"?>\n<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+  [[ -n "${maps:-}" ]] && printf '%s\n' "$maps" | while IFS= read -r m; do printf '  <sitemap><loc>/%s</loc></sitemap>\n' "$m"; done
+  printf '</sitemapindex>\n'
+} > "$dst/sitemap_index.xml"
+
+ln -sfn "$dst" "$ROOT/current"
+echo "[RELEASE] current -> $dst"
