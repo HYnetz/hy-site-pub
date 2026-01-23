@@ -1,0 +1,193 @@
+name: hy-cycle-core
+'on':
+  workflow_call:
+
+permissions:
+  contents: write
+
+jobs:
+  shards:
+    name: shard ${{ matrix.shard }}/48
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      max-parallel: 12
+      matrix:
+        shard: [1,2,3,4,5,6,7,8,9,10,
+                11,12,13,14,15,16,17,18,19,20,
+                21,22,23,24,25,26,27,28,29,30,
+                31,32,33,34,35,36,37,38,39,40,
+                41,42,43,44,45,46,47,48]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: |
+            .github
+            current
+          sparse-checkout-cone-mode: false
+            ops
+            seeds
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Write seeds (YAML-safe)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p seeds out
+          python3 - <<'PY'
+          import pathlib
+          seeds = [
+            "https://www.nasa.gov/sitemap.xml",
+            "https://www.noaa.gov/sitemap.xml",
+            "https://www.usgs.gov/sitemap.xml",
+            "https://data.gov/sitemap.xml",
+            "https://data.europa.eu/sitemap.xml",
+            "https://www.esa.int/sitemap.xml",
+            "https://www.gov.uk/sitemap.xml",
+            "https://www.un.org/sitemap.xml",
+          ]
+          pathlib.Path("seeds/all.txt").write_text("\n".join(seeds) + "\n")
+          PY
+
+      - name: Build shard artifact (sitemap parse only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          : > urls.txt
+          SHARD="${{ matrix.shard }}"; SHARDS=48
+
+          awk -v s="$SHARD" -v n="$SHARDS" 'BEGIN{i=0} NF{ if((i % n)+1==s) print; i++ }' seeds/all.txt > seeds/shard.txt
+
+          python3 - <<'PY' || true
+          import pathlib, urllib.request, xml.etree.ElementTree as ET
+          seeds = pathlib.Path("seeds/shard.txt").read_text().splitlines()
+          out = pathlib.Path("out"); out.mkdir(exist_ok=True)
+          urls = []
+
+          ns = {"sm":"http://www.sitemaps.org/schemas/sitemap/0.9"}
+
+          for s in seeds:
+            s=s.strip()
+            if not s: continue
+            try:
+              req = urllib.request.Request(s, headers={"User-Agent":"HY-ingest/1.0"})
+              with urllib.request.urlopen(req, timeout=25) as r:
+                data = r.read()
+              root = ET.fromstring(data)
+              cand = [e.text for e in root.findall(".//sm:loc", ns) if e.text]
+              urls.extend(cand[:300])
+            except Exception:
+              pass
+
+          # cap
+          urls = [u for u in urls if isinstance(u,str)][:2000]
+          (out/"urls.txt").write_text("\n".join(urls) + ("\n" if urls else ""))
+          PY
+          test -f urls.txt || : > urls.txt
+
+          tar -C out -czf "out/shard-${SHARD}.tgz" urls.txt
+          ls -lh out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: out/shard-${{ matrix.shard }}.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  stitch:
+    name: stitch → commit current/
+    runs-on: ubuntu-latest
+    needs: shards
+    if: ${{ always() }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: |
+            .github
+            current
+          sparse-checkout-cone-mode: false
+            ops
+            seeds
+
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          path: _ing
+          pattern: shard-*
+          merge-multiple: true
+
+      - name: Stitch + write current/
+        shell: bash
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p _ing current _tmp
+          echo "Artifacts (sample):"
+          find _ing -type f | head -n 60 || true
+          
+          rm -rf _tmp/extract
+          mkdir -p _tmp/extract
+          : > current/urls_raw.txt
+          
+          count=0
+          found=0
+          while IFS= read -r -d '' f; do
+            count=$((count+1))
+            b=$(basename "$f" .tgz)
+            d="_tmp/extract/$b"
+            mkdir -p "$d"
+            tar -xzf "$f" -C "$d" 2>/dev/null || true
+            if [ -f "$d/urls.txt" ]; then
+              found=$((found+1))
+              cat "$d/urls.txt" >> current/urls_raw.txt || true
+            fi
+          done < <(find _ing -type f -name '*.tgz' -print0 2>/dev/null || true)
+          
+          echo "tgz_files=$count urls_txt_found=$found raw_size=$(wc -c < current/urls_raw.txt 2>/dev/null || echo 0)"
+          
+          # If empty, last-resort scrape URL-looking strings from extracted contents
+          if [ ! -s current/urls_raw.txt ]; then
+            grep -RhoE --binary-files=text 'https?://[^" <>()]+' _tmp/extract 2>/dev/null >> current/urls_raw.txt || true
+          fi
+          
+          # Always write outputs (even if empty) so commit step can run
+          awk 'NF' current/urls_raw.txt | sort -u > current/urls.txt || true
+          python3 ops/make_current_meta.py --urls current/urls.txt --run-id "${{ github.run_id }}" --tgz-files "${count:-}"
+          python3 ops/discover_seeds.py --urls current/urls.txt --max-new 500
+          echo "urls_total=$(wc -l < current/urls.txt 2>/dev/null || echo 0)"
+          
+          now=$(date -u +%FT%TZ)
+          printf '<!doctype html><meta charset="utf-8"><title>HY Status</title><h1>HY CYCLE</h1><p>%s</p><p>urls=%s</p>\n' "$now" "$(wc -l < current/urls.txt 2>/dev/null || echo 0)" > current/status.html
+          printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"></sitemapindex>' > current/sitemap_index.xml
+          cat > current/robots.txt <<EOF
+          User-agent: *
+          Disallow:
+          EOF
+      - name: Commit current/ to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '--- git status (before) ---'
+          git status --porcelain || true
+          ls -la current || true
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f -A current || true
+          git add -A seeds || true
+          if git diff --cached --quiet; then
+            echo 'No changes in current/ to commit.'
+            exit 0
+          fi
+          git commit -m "data: update current (auto)"
+          git push origin HEAD:main
