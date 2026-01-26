@@ -27,9 +27,9 @@ jobs:
           sparse-checkout: |
             .github
             current
-          sparse-checkout-cone-mode: false
             ops
             seeds
+          sparse-checkout-cone-mode: false
 
       - uses: actions/setup-python@v5
         with:
@@ -90,7 +90,7 @@ jobs:
           urls = [u for u in urls if isinstance(u,str)][:2000]
           (out/"urls.txt").write_text("\n".join(urls) + ("\n" if urls else ""))
           PY
-          test -f urls.txt || : > urls.txt
+          test -f out/urls.txt || : > out/urls.txt
 
           tar -C out -czf "out/shard-${SHARD}.tgz" urls.txt
           ls -lh out
@@ -115,9 +115,9 @@ jobs:
           sparse-checkout: |
             .github
             current
-          sparse-checkout-cone-mode: false
             ops
             seeds
+          sparse-checkout-cone-mode: false
 
       - uses: actions/download-artifact@v4
         continue-on-error: true
@@ -190,4 +190,4 @@ jobs:
             exit 0
           fi
           git commit -m "data: update current (auto)"
-          git push origin HEAD:main
+          git push origin HEAD:${GITHUB_REF_NAME}
