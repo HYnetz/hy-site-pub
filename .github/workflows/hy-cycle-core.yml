@@ -19,6 +19,7 @@ jobs:
                 21,22,23,24,25,26,27,28,29,30,
                 31,32,33,34,35,36,37,38,39,40,
                 41,42,43,44,45,46,47,48]
+
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,8 +28,6 @@ jobs:
           sparse-checkout: |
             .github
             current
-            ops
-            seeds
           sparse-checkout-cone-mode: false
 
       - uses: actions/setup-python@v5
@@ -55,58 +54,214 @@ jobs:
           pathlib.Path("seeds/all.txt").write_text("\n".join(seeds) + "\n")
           PY
 
-      - name: Build shard artifact (sitemap parse only)
+      - name: Build shard artifact (sitemap + stage2 fetch a few pages)
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p out
-          : > urls.txt
           SHARD="${{ matrix.shard }}"; SHARDS=48
 
           awk -v s="$SHARD" -v n="$SHARDS" 'BEGIN{i=0} NF{ if((i % n)+1==s) print; i++ }' seeds/all.txt > seeds/shard.txt
 
-          python3 - <<'PY' || true
-          import pathlib, urllib.request, xml.etree.ElementTree as ET
-          seeds = pathlib.Path("seeds/shard.txt").read_text().splitlines()
+          python3 - <<'PY'
+          import pathlib, urllib.request, urllib.error, xml.etree.ElementTree as ET
+          import time, re
+          from urllib.parse import urlparse, urljoin, urldefrag
+          from html.parser import HTMLParser
+
+          seeds = pathlib.Path("seeds/shard.txt").read_text(encoding="utf-8", errors="replace").splitlines()
           out = pathlib.Path("out"); out.mkdir(exist_ok=True)
-          urls = []
 
-          ns = {"sm":"http://www.sitemaps.org/schemas/sitemap/0.9"}
+          UA = "HYnetBot/0.1 (+https://github.com/HYnetz/hy-site-pub)"
+          TIMEOUT = 12
+          MAX_BYTES = 256 * 1024   # hard cap per page body
+          SUB_SITEMAPS = 12        # if seed is sitemapindex, expand this many child sitemaps
+          URLS_PER_SITEMAP = 600   # cap per sitemap file
+          MAX_URLS_TOTAL = 5000    # cap output urls
+          PAGES_TO_FETCH = 20      # stage2: fetch only a few pages per shard
+          LINKS_PER_PAGE = 40      # cap discovery per fetched page
+          DISCOVER_CAP = 1200      # total discovered links per shard
+          SAME_HOST_ONLY = True    # keep discovery bounded & safe
 
-          for s in seeds:
-            s=s.strip()
-            if not s: continue
+          def fetch_bytes(url: str):
+            req = urllib.request.Request(
+              url,
+              headers={
+                "User-Agent": UA,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+              },
+            )
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+              ct = (r.headers.get("Content-Type") or "").lower()
+              b = r.read(MAX_BYTES + 1)
+              if len(b) > MAX_BYTES:
+                raise ValueError("too_big")
+              return b, ct
+
+          def parse_sitemap_url(url: str):
+            # returns (kind, locs)
+            b, ct = fetch_bytes(url)
+            # some sitemaps return text/xml or application/xml; either is ok
             try:
-              req = urllib.request.Request(s, headers={"User-Agent":"HY-ingest/1.0"})
-              with urllib.request.urlopen(req, timeout=25) as r:
-                data = r.read()
-              root = ET.fromstring(data)
-              cand = [e.text for e in root.findall(".//sm:loc", ns) if e.text]
-              urls.extend(cand[:300])
+              root = ET.fromstring(b)
             except Exception:
-              pass
+              # strip leading junk if any
+              m = re.search(br'(<\?xml|<urlset|<sitemapindex)', b)
+              if m:
+                root = ET.fromstring(b[m.start():])
+              else:
+                raise
+            # namespace-agnostic loc search
+            locs = [n.text.strip() for n in root.findall(".//{*}loc") if n.text and n.text.strip()]
+            tag = root.tag.lower()
+            if tag.endswith("sitemapindex"):
+              return ("index", locs)
+            return ("urlset", locs)
 
-          # cap
-          urls = [u for u in urls if isinstance(u,str)][:2000]
-          (out/"urls.txt").write_text("\n".join(urls) + ("\n" if urls else ""))
+          def is_http(u: str) -> bool:
+            try:
+              p = urlparse(u)
+              return p.scheme in ("http", "https") and bool(p.netloc)
+            except Exception:
+              return False
+
+          # --- 1) collect URLs from sitemaps (expand index one level) ---
+          urls = []
+          seen = set()
+
+          def add_url(u: str):
+            if not u: return
+            u = u.strip()
+            if not is_http(u): return
+            u = urldefrag(u)[0]
+            if u in seen: return
+            seen.add(u)
+            urls.append(u)
+
+          for s in [x.strip() for x in seeds if x.strip()]:
+            try:
+              kind, locs = parse_sitemap_url(s)
+              if kind == "index":
+                for child in locs[:SUB_SITEMAPS]:
+                  try:
+                    kind2, locs2 = parse_sitemap_url(child)
+                    for u in locs2[:URLS_PER_SITEMAP]:
+                      add_url(u)
+                  except Exception:
+                    # ignore one bad child
+                    continue
+              else:
+                for u in locs[:URLS_PER_SITEMAP]:
+                  add_url(u)
+            except Exception:
+              continue
+
+            if len(urls) >= MAX_URLS_TOTAL:
+              break
+
+          # --- 2) stage2: fetch a few HTML pages + extract links (bounded) ---
+          class LinkGrabber(HTMLParser):
+            def __init__(self):
+              super().__init__()
+              self.links = []
+            def handle_starttag(self, tag, attrs):
+              for (k,v) in attrs:
+                if not v: continue
+                k = k.lower()
+                if k in ("href","src"):
+                  self.links.append(v)
+
+          discovered = []
+          disc_seen = set()
+          errors = []
+
+          # pick a slice to reduce "always same first pages"
+          sample = urls[:]
+          if len(sample) > 0:
+            stride = max(1, len(sample)//max(1, PAGES_TO_FETCH))
+            sample = sample[::stride][:PAGES_TO_FETCH]
+
+          for page_url in sample:
+            try:
+              # optional bound: same host discovery (prevents fungal explosion)
+              host = urlparse(page_url).netloc
+
+              b, ct = fetch_bytes(page_url)
+              if "text/html" not in ct and "application/xhtml" not in ct:
+                continue
+
+              # decode loosely
+              try:
+                txt = b.decode("utf-8", errors="ignore")
+              except Exception:
+                txt = b.decode(errors="ignore")
+
+              p = LinkGrabber()
+              try:
+                p.feed(txt)
+              except Exception:
+                continue
+
+              per_page = 0
+              for raw in p.links:
+                if per_page >= LINKS_PER_PAGE: break
+                raw = raw.strip()
+                if not raw or raw.startswith(("mailto:","javascript:","data:","#")):
+                  continue
+                u = urljoin(page_url, raw)
+                u = urldefrag(u)[0]
+                if not is_http(u):
+                  continue
+                if SAME_HOST_ONLY and urlparse(u).netloc != host:
+                  continue
+                if u in seen or u in disc_seen:
+                  continue
+                disc_seen.add(u)
+                discovered.append(u)
+                per_page += 1
+                if len(discovered) >= DISCOVER_CAP:
+                  break
+
+              time.sleep(0.15)
+              if len(discovered) >= DISCOVER_CAP:
+                break
+
+            except Exception as e:
+              errors.append(f"{page_url}\t{type(e).__name__}:{e}")
+
+          # merge discovered into urls (keep caps)
+          for u in discovered:
+            if len(urls) >= MAX_URLS_TOTAL:
+              break
+            add_url(u)
+
+          urls = urls[:MAX_URLS_TOTAL]
+
+          # always write these three files so tar never fails
+          (out/"urls.txt").write_text("\n".join(urls) + ("\n" if urls else ""), encoding="utf-8")
+          (out/"report.txt").write_text(
+            f"seed_lines={len([x for x in seeds if x.strip()])}\n"
+            f"urls_out={len(urls)}\n"
+            f"pages_fetched_attempted={len(sample)}\n"
+            f"discovered={len(discovered)}\n",
+            encoding="utf-8"
+          )
+          (out/"errors.txt").write_text("\n".join(errors) + ("\n" if errors else ""), encoding="utf-8")
           PY
-          test -f out/urls.txt || : > out/urls.txt
 
-          tar -C out -czf "out/shard-${SHARD}.tgz" urls.txt
-          ls -lh out
+          tar -C out -czf "out/shard-${SHARD}.tgz" urls.txt report.txt errors.txt
 
       - uses: actions/upload-artifact@v4
         with:
           name: shard-${{ matrix.shard }}
           path: out/shard-${{ matrix.shard }}.tgz
           if-no-files-found: error
-          retention-days: 7
 
   stitch:
     name: stitch → commit current/
-    runs-on: ubuntu-latest
     needs: shards
-    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
     steps:
       - uses: actions/checkout@v4
         with:
@@ -115,88 +270,59 @@ jobs:
           sparse-checkout: |
             .github
             current
-            ops
-            seeds
           sparse-checkout-cone-mode: false
 
       - uses: actions/download-artifact@v4
-        continue-on-error: true
         with:
           path: _ing
-          pattern: shard-*
-          merge-multiple: true
 
       - name: Stitch + write current/
         shell: bash
         env:
           REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          mkdir -p _ing current _tmp
-          echo "Artifacts (sample):"
-          find _ing -type f | head -n 60 || true
-          
-          rm -rf _tmp/extract
-          mkdir -p _tmp/extract
+
+          rm -rf _tmp
+          mkdir -p _tmp current
+
           : > current/urls_raw.txt
-          
+
+          # merge urls.txt from every shard tgz
           count=0
-          found=0
-          while IFS= read -r -d '' f; do
+          for f in $(find _ing -type f -name '*.tgz' 2>/dev/null || true); do
             count=$((count+1))
-            b=$(basename "$f" .tgz)
-            d="_tmp/extract/$b"
-            mkdir -p "$d"
-            tar -xzf "$f" -C "$d" 2>/dev/null || true
-            if [ -f "$d/urls.txt" ]; then
-              found=$((found+1))
-              cat "$d/urls.txt" >> current/urls_raw.txt || true
+            tar -C _tmp -xzf "$f" urls.txt report.txt errors.txt 2>/dev/null || true
+            if [ -f _tmp/urls.txt ]; then
+              cat _tmp/urls.txt >> current/urls_raw.txt || true
+              : > _tmp/urls.txt
             fi
-          done < <(find _ing -type f -name '*.tgz' -print0 2>/dev/null || true)
-          
-          echo "tgz_files=$count urls_txt_found=$found raw_size=$(wc -c < current/urls_raw.txt 2>/dev/null || echo 0)"
-          
-          # If empty, last-resort scrape URL-looking strings from extracted contents
-          if [ ! -s current/urls_raw.txt ]; then
-            grep -RhoE --binary-files=text 'https?://[^" <>()]+' _tmp/extract 2>/dev/null >> current/urls_raw.txt || true
-          fi
-          
-          # Always write outputs (even if empty) so commit step can run
-          awk 'NF' current/urls_raw.txt | sort -u > current/urls.txt || true
-          if [ -f ops/make_current_meta.py ]; then
-          python3 ops/make_current_meta.py --urls current/urls.txt --run-id "${{ github.run_id }}" --tgz-files "${count:-}" || true
-          else
-            echo '{}' > current/meta.json
-            echo "(info) missing ops/make_current_meta.py, wrote empty meta.json"
-          fi
-          if [ -f ops/discover_seeds.py ]; then
-          python3 ops/discover_seeds.py --urls current/urls.txt --max-new 500 || true
-          else
-            echo "(info) missing ops/discover_seeds.py, skipping"
-          fi
-          echo "urls_total=$(wc -l < current/urls.txt 2>/dev/null || echo 0)"
-          
-          now=$(date -u +%FT%TZ)
-          printf '<!doctype html><meta charset="utf-8"><title>HY Status</title><h1>HY CYCLE</h1><p>%s</p><p>urls=%s</p>\n' "$now" "$(wc -l < current/urls.txt 2>/dev/null || echo 0)" > current/status.html
+          done
+
+          # normalize + dedupe
+          awk 'NF' current/urls_raw.txt | sed 's/\r$//' | sort -u > current/urls.txt || true
+          lines="$(wc -l < current/urls.txt 2>/dev/null || echo 0)"
+          now="$(date -u +%FT%TZ)"
+
+          printf '<!doctype html><meta charset="utf-8"><title>HY Status</title><h1>HY CYCLE OK</h1><p>%s</p><p>urls=%s</p><p>tgz_files=%s</p>\n' "$now" "$lines" "$count" > current/status.html
           printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"></sitemapindex>' > current/sitemap_index.xml
-          cat > current/robots.txt <<EOF
-          User-agent: *
-          Disallow:
-          EOF
-      - name: Commit current/ to main
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo '--- git status (before) ---'
-          git status --porcelain || true
-          ls -la current || true
+
+          {
+            echo "User-agent: *"
+            echo "Sitemap: https://raw.githubusercontent.com/$REPO/$BRANCH/current/sitemap_index.xml"
+          } > current/robots.txt
+
+          # Commit & push if changed
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # force-add current even if ignored
           git add -f -A current || true
-          git add -A seeds || true
+
           if git diff --cached --quiet; then
-            echo 'No changes in current/ to commit.'
-            exit 0
+            echo "No changes to commit."
+          else
+            git commit -m "data: update current (auto)"
+            git push origin "HEAD:${BRANCH}"
           fi
-          git commit -m "data: update current (auto)"
-          git push origin HEAD:${GITHUB_REF_NAME}
