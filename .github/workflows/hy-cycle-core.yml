@@ -163,8 +163,17 @@ jobs:
           
           # Always write outputs (even if empty) so commit step can run
           awk 'NF' current/urls_raw.txt | sort -u > current/urls.txt || true
-          python3 ops/make_current_meta.py --urls current/urls.txt --run-id "${{ github.run_id }}" --tgz-files "${count:-}"
-          python3 ops/discover_seeds.py --urls current/urls.txt --max-new 500
+          if [ -f ops/make_current_meta.py ]; then
+          python3 ops/make_current_meta.py --urls current/urls.txt --run-id "${{ github.run_id }}" --tgz-files "${count:-}" || true
+          else
+            echo '{}' > current/meta.json
+            echo "(info) missing ops/make_current_meta.py, wrote empty meta.json"
+          fi
+          if [ -f ops/discover_seeds.py ]; then
+          python3 ops/discover_seeds.py --urls current/urls.txt --max-new 500 || true
+          else
+            echo "(info) missing ops/discover_seeds.py, skipping"
+          fi
           echo "urls_total=$(wc -l < current/urls.txt 2>/dev/null || echo 0)"
           
           now=$(date -u +%FT%TZ)

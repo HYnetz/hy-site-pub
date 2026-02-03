@@ -1,9 +1,8 @@
 name: hy-cycle-wrapper
-
 'on':
   workflow_dispatch:
-  schedule:
-    - cron: "30 */6 * * *"
+  # schedule:
+  #   - cron: "30 */6 * * *"
 
 permissions:
   contents: write
