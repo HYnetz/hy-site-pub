@@ -36,26 +36,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Write seeds (YAML-safe)
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p seeds out
-          python3 - <<'PY'
-          import pathlib
-          seeds = [
-            "https://www.nasa.gov/sitemap.xml",
-            "https://www.noaa.gov/sitemap.xml",
-            "https://www.usgs.gov/sitemap.xml",
-            "https://data.gov/sitemap.xml",
-            "https://data.europa.eu/sitemap.xml",
-            "https://www.esa.int/sitemap.xml",
-            "https://www.gov.uk/sitemap.xml",
-            "https://www.un.org/sitemap.xml",
-          ]
-          pathlib.Path("seeds/all.txt").write_text("\n".join(seeds) + "\n")
-          PY
-
+      
       - name: Build shard artifact (sitemap + stage2 fetch a few pages)
         shell: bash
         run: |
