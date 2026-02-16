@@ -28,6 +28,8 @@ jobs:
           sparse-checkout: |
             .github
             current
+            ops
+            seeds
           sparse-checkout-cone-mode: false
 
       - uses: actions/setup-python@v5
@@ -270,6 +272,8 @@ jobs:
           sparse-checkout: |
             .github
             current
+            ops
+            seeds
           sparse-checkout-cone-mode: false
 
       - uses: actions/download-artifact@v4
