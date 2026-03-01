@@ -1,17 +1,22 @@
 name: hy-operator
 
 on:
+  workflow_dispatch:
+    inputs:
+      cmd:
+        description: "Command, e.g. /hy status"
+        required: true
+        default: "/hy status"
   issue_comment:
     types: [created]
 
 permissions:
   contents: write
   issues: write
-  actions: write
 
 jobs:
   operator:
-    if: startsWith(github.event.comment.body, '/hy')
+    if: contains(github.event.comment.body, '/hy') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,14 +30,19 @@ jobs:
 
       - name: Run HY operator
         env:
-          HY_CMD: ${{ github.event.comment.body }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HY_CMD: ${{ github.event.inputs.cmd || github.event.comment.body }}
         run: |
           set -euo pipefail
           python3 ops/hy_operator.py > reply.md
+          if [ ! -s reply.md ]; then
+            echo "### HY" > reply.md
+            echo "Empty reply (no /hy line found?)" >> reply.md
+          fi
+          echo "=== reply.md ==="
+          sed -n '1,120p' reply.md
 
-          # If seeds changed, commit them
-          if git status --porcelain | grep -q '^ M seeds/all.txt'; then
+          # commit seeds if changed
+          if git status --porcelain | grep -q 'seeds/all.txt'; then
             git config user.name  "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git add seeds/all.txt
@@ -43,6 +53,7 @@ jobs:
       - name: Reply in the issue
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
             const body = fs.readFileSync('reply.md','utf8');
