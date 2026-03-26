@@ -3,6 +3,11 @@ name: hy-cycle-core
   workflow_call:
 
 permissions:
+
+concurrency:
+  group: hy-cycle-${{ github.ref }}
+  cancel-in-progress: true
+
   contents: write
 
 jobs:
