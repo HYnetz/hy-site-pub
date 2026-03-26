@@ -1,0 +1,313 @@
+name: hy-cycle-core
+'on':
+  workflow_call:
+
+permissions:
+  contents: write
+
+jobs:
+  shards:
+    name: shard ${{ matrix.shard }}/48
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      max-parallel: 12
+      matrix:
+        shard: [1,2,3,4,5,6,7,8,9,10,
+                11,12,13,14,15,16,17,18,19,20,
+                21,22,23,24,25,26,27,28,29,30,
+                31,32,33,34,35,36,37,38,39,40,
+                41,42,43,44,45,46,47,48]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: |
+            .github
+            current
+            ops
+            seeds
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      
+      - name: Build shard artifact (sitemap + stage2 fetch a few pages)
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHARD="${{ matrix.shard }}"; SHARDS=48
+
+          awk -v s="$SHARD" -v n="$SHARDS" 'BEGIN{i=0} NF{ if((i % n)+1==s) print; i++ }' seeds/all.txt > seeds/shard.txt
+
+          python3 - <<'PY'
+          import pathlib, urllib.request, urllib.error, xml.etree.ElementTree as ET
+          import time, re
+          from urllib.parse import urlparse, urljoin, urldefrag
+          from html.parser import HTMLParser
+
+          seeds = pathlib.Path("seeds/shard.txt").read_text(encoding="utf-8", errors="replace").splitlines()
+          out = pathlib.Path("out"); out.mkdir(exist_ok=True)
+
+          UA = "HYnetBot/0.1 (+https://github.com/HYnetz/hy-site-pub)"
+          TIMEOUT = 12
+          MAX_BYTES = 256 * 1024   # hard cap per page body
+          SUB_SITEMAPS = 12        # if seed is sitemapindex, expand this many child sitemaps
+          URLS_PER_SITEMAP = 600   # cap per sitemap file
+          MAX_URLS_TOTAL = 5000    # cap output urls
+          PAGES_TO_FETCH = 20      # stage2: fetch only a few pages per shard
+          LINKS_PER_PAGE = 40      # cap discovery per fetched page
+          DISCOVER_CAP = 1200      # total discovered links per shard
+          SAME_HOST_ONLY = True    # keep discovery bounded & safe
+
+          def fetch_bytes(url: str):
+            req = urllib.request.Request(
+              url,
+              headers={
+                "User-Agent": UA,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+              },
+            )
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+              ct = (r.headers.get("Content-Type") or "").lower()
+              b = r.read(MAX_BYTES + 1)
+              if len(b) > MAX_BYTES:
+                raise ValueError("too_big")
+              return b, ct
+
+          def parse_sitemap_url(url: str):
+            # returns (kind, locs)
+            b, ct = fetch_bytes(url)
+            # some sitemaps return text/xml or application/xml; either is ok
+            try:
+              root = ET.fromstring(b)
+            except Exception:
+              # strip leading junk if any
+              m = re.search(br'(<\?xml|<urlset|<sitemapindex)', b)
+              if m:
+                root = ET.fromstring(b[m.start():])
+              else:
+                raise
+            # namespace-agnostic loc search
+            locs = [n.text.strip() for n in root.findall(".//{*}loc") if n.text and n.text.strip()]
+            tag = root.tag.lower()
+            if tag.endswith("sitemapindex"):
+              return ("index", locs)
+            return ("urlset", locs)
+
+          def is_http(u: str) -> bool:
+            try:
+              p = urlparse(u)
+              return p.scheme in ("http", "https") and bool(p.netloc)
+            except Exception:
+              return False
+
+          # --- 1) collect URLs from sitemaps (expand index one level) ---
+          urls = []
+          seen = set()
+
+          def add_url(u: str):
+            if not u: return
+            u = u.strip()
+            if not is_http(u): return
+            u = urldefrag(u)[0]
+            if u in seen: return
+            seen.add(u)
+            urls.append(u)
+
+          for s in [x.strip() for x in seeds if x.strip()]:
+            try:
+              kind, locs = parse_sitemap_url(s)
+              if kind == "index":
+                for child in locs[:SUB_SITEMAPS]:
+                  try:
+                    kind2, locs2 = parse_sitemap_url(child)
+                    for u in locs2[:URLS_PER_SITEMAP]:
+                      add_url(u)
+                  except Exception:
+                    # ignore one bad child
+                    continue
+              else:
+                for u in locs[:URLS_PER_SITEMAP]:
+                  add_url(u)
+            except Exception:
+              continue
+
+            if len(urls) >= MAX_URLS_TOTAL:
+              break
+
+          # --- 2) stage2: fetch a few HTML pages + extract links (bounded) ---
+          class LinkGrabber(HTMLParser):
+            def __init__(self):
+              super().__init__()
+              self.links = []
+            def handle_starttag(self, tag, attrs):
+              for (k,v) in attrs:
+                if not v: continue
+                k = k.lower()
+                if k in ("href","src"):
+                  self.links.append(v)
+
+          discovered = []
+          disc_seen = set()
+          errors = []
+
+          # pick a slice to reduce "always same first pages"
+          sample = urls[:]
+          if len(sample) > 0:
+            stride = max(1, len(sample)//max(1, PAGES_TO_FETCH))
+            sample = sample[::stride][:PAGES_TO_FETCH]
+
+          for page_url in sample:
+            try:
+              # optional bound: same host discovery (prevents fungal explosion)
+              host = urlparse(page_url).netloc
+
+              b, ct = fetch_bytes(page_url)
+              if "text/html" not in ct and "application/xhtml" not in ct:
+                continue
+
+              # decode loosely
+              try:
+                txt = b.decode("utf-8", errors="ignore")
+              except Exception:
+                txt = b.decode(errors="ignore")
+
+              p = LinkGrabber()
+              try:
+                p.feed(txt)
+              except Exception:
+                continue
+
+              per_page = 0
+              for raw in p.links:
+                if per_page >= LINKS_PER_PAGE: break
+                raw = raw.strip()
+                if not raw or raw.startswith(("mailto:","javascript:","data:","#")):
+                  continue
+                u = urljoin(page_url, raw)
+                u = urldefrag(u)[0]
+                if not is_http(u):
+                  continue
+                if SAME_HOST_ONLY and urlparse(u).netloc != host:
+                  continue
+                if u in seen or u in disc_seen:
+                  continue
+                disc_seen.add(u)
+                discovered.append(u)
+                per_page += 1
+                if len(discovered) >= DISCOVER_CAP:
+                  break
+
+              time.sleep(0.15)
+              if len(discovered) >= DISCOVER_CAP:
+                break
+
+            except Exception as e:
+              errors.append(f"{page_url}\t{type(e).__name__}:{e}")
+
+          # merge discovered into urls (keep caps)
+          for u in discovered:
+            if len(urls) >= MAX_URLS_TOTAL:
+              break
+            add_url(u)
+
+          urls = urls[:MAX_URLS_TOTAL]
+
+          # always write these three files so tar never fails
+          (out/"urls.txt").write_text("\n".join(urls) + ("\n" if urls else ""), encoding="utf-8")
+          (out/"report.txt").write_text(
+            f"seed_lines={len([x for x in seeds if x.strip()])}\n"
+            f"urls_out={len(urls)}\n"
+            f"pages_fetched_attempted={len(sample)}\n"
+            f"discovered={len(discovered)}\n",
+            encoding="utf-8"
+          )
+          (out/"errors.txt").write_text("\n".join(errors) + ("\n" if errors else ""), encoding="utf-8")
+          PY
+
+          tar -C out -czf "out/shard-${SHARD}.tgz" urls.txt report.txt errors.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: out/shard-${{ matrix.shard }}.tgz
+          if-no-files-found: error
+
+  stitch:
+    name: stitch → commit current/
+    needs: shards
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: |
+            .github
+            current
+            ops
+            seeds
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: _ing
+
+      - name: Stitch + write current/
+        shell: bash
+        env:
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          rm -rf _tmp
+          mkdir -p _tmp current
+
+          : > current/urls_raw.txt
+
+          # merge urls.txt from every shard tgz
+          count=0
+          for f in $(find _ing -type f -name '*.tgz' 2>/dev/null || true); do
+            count=$((count+1))
+            tar -C _tmp -xzf "$f" urls.txt report.txt errors.txt 2>/dev/null || true
+            if [ -f _tmp/urls.txt ]; then
+              cat _tmp/urls.txt >> current/urls_raw.txt || true
+              : > _tmp/urls.txt
+            fi
+          done
+
+          # normalize + dedupe
+          awk 'NF' current/urls_raw.txt | sed 's/\r$//' | sort -u > current/urls.txt || true
+          lines="$(wc -l < current/urls.txt 2>/dev/null || echo 0)"
+          now="$(date -u +%FT%TZ)"
+
+          printf '<!doctype html><meta charset="utf-8"><title>HY Status</title><h1>HY CYCLE OK</h1><p>%s</p><p>urls=%s</p><p>tgz_files=%s</p>\n' "$now" "$lines" "$count" > current/status.html
+          printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"></sitemapindex>' > current/sitemap_index.xml
+
+          {
+            echo "User-agent: *"
+            echo "Sitemap: https://raw.githubusercontent.com/$REPO/$BRANCH/current/sitemap_index.xml"
+          } > current/robots.txt
+
+          # Commit & push if changed
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # force-add current even if ignored
+          git add -f -A current || true
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "data: update current (auto)"
+            git push origin "HEAD:${BRANCH}"
+          fi
