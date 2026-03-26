@@ -2,11 +2,11 @@ name: hy-cycle-core
 'on':
   workflow_call:
 
-permissions:
-
 concurrency:
   group: hy-cycle-${{ github.ref }}
   cancel-in-progress: true
+
+permissions:
 
   contents: write
 
