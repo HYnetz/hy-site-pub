@@ -1,0 +1,12 @@
+name: hy-cycle-wrapper
+'on':
+  workflow_dispatch:
+  # schedule:
+  #   - cron: "30 */6 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    uses: ./.github/workflows/hy-cycle-core.yml
