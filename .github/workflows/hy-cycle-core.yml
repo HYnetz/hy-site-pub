@@ -273,6 +273,8 @@ jobs:
           BRANCH: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          mkdir -p _tmp
+          cp -f current/urls.txt _tmp/prev_urls.txt 2>/dev/null || : > _tmp/prev_urls.txt
 
           rm -rf _tmp
           mkdir -p _tmp current
@@ -309,6 +311,13 @@ jobs:
 
           # force-add current even if ignored
           git add -f -A current || true
+          # delta (new/gone URLs since previous run)
+          if [ -f _tmp/prev_urls.txt ] && [ -f current/urls.txt ]; then
+            sort -u _tmp/prev_urls.txt > _tmp/prev_sorted.txt || true
+            sort -u current/urls.txt  > _tmp/now_sorted.txt  || true
+            comm -13 _tmp/prev_sorted.txt _tmp/now_sorted.txt > current/delta_new.txt  || true
+            comm -23 _tmp/prev_sorted.txt _tmp/now_sorted.txt > current/delta_gone.txt || true
+          fi
           # delta (new/gone URLs since previous run)
           if [ -f _tmp/prev_urls.txt ] && [ -f current/urls.txt ]; then
             sort -u _tmp/prev_urls.txt > _tmp/prev_sorted.txt || true
