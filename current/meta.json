@@ -1,8 +1,13 @@
 {
-  "ts": "2026-02-13T12:30:28Z",
+  "api": {
+    "endpoint": "/v1/delta",
+    "header": "x-api-key",
+    "worker_url": "https://hy-delta.sven-goltz.workers.dev"
+  },
+  "discovered": 522,
   "queue": 522,
   "seen": 8,
-  "urls": 283,
-  "discovered": 522,
-  "take": 8
+  "take": 8,
+  "ts": "2026-02-13T12:30:28Z",
+  "urls": 283
 }
