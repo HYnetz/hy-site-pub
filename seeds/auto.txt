@@ -1,6 +1,0 @@
-https://data.gov/sitemap.xml
-https://data.gov/sitemap_index.xml
-https://data.gov/wp-sitemap.xml
-https://www.nasa.gov/sitemap.xml
-https://www.nasa.gov/sitemap_index.xml
-https://www.nasa.gov/wp-sitemap.xml

@@ -1,6 +1,0 @@
-{
-  "mode": "allow",
-  "locales_allow": ["en","de"],
-  "lanes_deny": [],
-  "cities_deny": []
-}
