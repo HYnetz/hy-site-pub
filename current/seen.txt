@@ -1,8 +1,0 @@
-https://data.europa.eu/sitemap.xml
-https://data.gov/sitemap.xml
-https://www.esa.int/sitemap.xml
-https://www.gov.uk/sitemap.xml
-https://www.nasa.gov/sitemap.xml
-https://www.noaa.gov/sitemap.xml
-https://www.un.org/sitemap.xml
-https://www.usgs.gov/sitemap.xml

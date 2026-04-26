@@ -1,2 +1,2 @@
 User-agent: *
-Sitemap: https://raw.githubusercontent.com/HYnetz/hy-site-pub/gh-pages/current/sitemap_index.xml
+Disallow:
